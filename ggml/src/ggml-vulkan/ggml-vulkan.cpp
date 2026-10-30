@@ -19076,7 +19076,12 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
         ggml_vk_instance_init();
         // No GGML_USE_* guard: see the Metal backend; that macro is not defined
         // for this target, so the registration was compiled out.
+#if !defined(__PROSPERO__)
+        // PS5LM fork: the MoE cache module calls raw Vulkan loader symbols,
+        // which the loader-less PS5 link cannot resolve; the PS5 is UMA
+        // anyway, so expert caching would bring nothing there.
         ggml_vulkan_moe_cache_register(&reg);
+#endif
         return &reg;
     } catch (const vk::SystemError& e) {
         VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: System error: " << e.what());
