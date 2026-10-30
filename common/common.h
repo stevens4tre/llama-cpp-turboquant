@@ -70,7 +70,11 @@ struct common_cpu_params {
     bool     mask_valid                  = false;   // Default: any CPU
     enum ggml_sched_priority  priority   = GGML_SCHED_PRIO_NORMAL;  // Scheduling prio : (0 - normal, 1 - medium, 2 - high, 3 - realtime)
     bool     strict_cpu                  = false;   // Use strict CPU placement
+#if defined(__PROSPERO__)
+    uint32_t poll                        = 0;       // PS5: no busy-waiting, the few cores a payload gets are shared with the system
+#else
     uint32_t poll                        = 50;      // Polling (busywait) level (0 - no polling, 100 - mostly polling)
+#endif
 };
 
 int32_t common_cpu_get_num_physical_cores();

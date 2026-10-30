@@ -29,6 +29,11 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__PROSPERO__)
+#include <pthread.h>
+extern "C" int scePthreadGetaffinity(pthread_t thread, uint64_t * mask);
+#endif
+
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -206,6 +211,16 @@ static int cpu_count_math_cpus(int n_cpu) {
  * Returns number of CPUs on system that are useful for math.
  */
 int32_t common_cpu_get_num_math() {
+#if defined(__PROSPERO__)
+    // PS5: a payload runs only on the cores its affinity mask allows (5 of 16 on
+    // firmware 13.60), and the console's own services share them. Keep two free:
+    // using all of them starves those services and the console shuts down.
+    uint64_t mask = 0;
+    if (scePthreadGetaffinity(pthread_self(), &mask) == 0 && mask != 0) {
+        return std::max(1, __builtin_popcountll(mask) - 2);
+    }
+    return 2;
+#endif
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
     int n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (n_cpu < 1) {
