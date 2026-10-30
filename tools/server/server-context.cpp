@@ -5813,9 +5813,8 @@ void server_routes::init_routes() {
         json data = body;
         if (body.count("messages") > 0 && !body.at("messages").is_null()) {
             const json introspect_field = body.at("introspect");
-            common_chat_session session;
             std::vector<raw_buffer> files;
-            json parsed = oaicompat_chat_params_parse(ctx_server.vocab, body, meta->chat_params, files, session);
+            json parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
             parsed["introspect"] = introspect_field;
             data = std::move(parsed);
         }
