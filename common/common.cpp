@@ -282,6 +282,11 @@ bool set_process_priority(enum ggml_sched_priority prio) {
     if (prio == GGML_SCHED_PRIO_NORMAL) {
         return true;
     }
+#if defined(__PROSPERO__)
+    // PS5: what setpriority does to a payload is unknown. ggml lowers its own
+    // threads' Sony priority for --prio -1 and refuses to raise them.
+    return prio == GGML_SCHED_PRIO_LOW;
+#endif
 
     int p = 0;
     switch (prio) {
