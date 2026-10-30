@@ -529,6 +529,41 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         }
     }
 
+    // PS5LM: some clients (Claude Code) send system messages inside
+    // `messages`; templates such as Qwen's refuse a system message that is not
+    // first. Fold every later one into the leading system message.
+    {
+        json merged = json::array();
+        std::string extra;
+        for (const auto & m : oai_messages) {
+            const std::string r = json_value(m, "role", std::string());
+            if ((r == "system" || r == "developer") && !merged.empty()) {
+                const json & c = m.contains("content") ? m.at("content") : json();
+                if (c.is_string()) {
+                    extra += "\n\n" + c.get<std::string>();
+                } else if (c.is_array()) {
+                    for (const auto & part : c) {
+                        extra += "\n\n" + json_value(part, "text", std::string());
+                    }
+                }
+                continue;
+            }
+            merged.push_back(m);
+        }
+        if (!extra.empty()) {
+            if (!merged.empty() && json_value(merged[0], "role", std::string()) == "system" && merged[0].at("content").is_string()) {
+                merged[0]["content"] = merged[0].at("content").get<std::string>() + extra;
+            } else {
+                json front = json::array();
+                front.push_back({ { "role", "system" }, { "content", extra.substr(2) } });
+                for (auto & m : merged) {
+                    front.push_back(std::move(m));
+                }
+                merged = std::move(front);
+            }
+        }
+        oai_messages = std::move(merged);
+    }
     oai_body["messages"] = oai_messages;
 
     // Convert tools
