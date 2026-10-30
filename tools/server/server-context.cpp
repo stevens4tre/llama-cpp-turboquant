@@ -420,6 +420,13 @@ struct server_slot {
 
     std::vector<completion_token_output> generated_token_probs;
 
+    // PS5LM fork: introspection results for the current task
+    server_introspect_result introspect;
+    int32_t                  introspect_n_full = 0;
+    int32_t                  introspect_n_gen  = 0;
+    int64_t                  introspect_n_bytes = 0;
+    std::vector<int64_t>     introspect_iv_modified;
+
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
@@ -556,6 +563,14 @@ struct server_slot {
         n_draft_total = 0;
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
+
+        // PS5LM fork: introspection state belongs to the task that just ended
+        introspect = {};
+        introspect_n_full = 0;
+        introspect_n_gen  = 0;
+        introspect_n_bytes = 0;
+        introspect_iv_modified.clear();
+
         n_accepted_per_pos.clear();
 
         task_prev = std::move(task);
@@ -1114,6 +1129,9 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // PS5LM fork: introspection (interpretability)
+    bool is_introspect_enabled() const { return introspect_enabled; }
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -1171,6 +1189,15 @@ private:
 
     int trace = 0;
     int slots_debug = 0;
+
+    // PS5LM fork: introspection (interpretability), env: LLAMA_INTROSPECT
+    // the capture engine is armed per request and consulted by the graph-eval
+    // callback; when nothing is armed it is a no-op on the decode path
+    bool                       introspect_enabled = false;
+    server_introspect_capture  introspect_capture;
+    int32_t                    introspect_n_layer = 0;
+    int64_t                    introspect_max_bytes = 256ll << 20; // env: LLAMA_INTROSPECT_MAX_BYTES
+
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
@@ -1482,11 +1509,33 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // PS5LM fork: introspection (interpretability).
+        // Install the graph-eval callback that lets a request copy intermediate
+        // tensors out of the compute graph. It does nothing until a request arms
+        // it, so this does not change ordinary generation. The raw-logits half of
+        // the feature needs no callback at all: it reads the context's output
+        // buffer, which llama.cpp fills for every batch row that asks for it.
+        {
+            // Off unless asked for: LLAMA_INTROSPECT=1 in the environment, or
+            // the app's Developer setting, which sets it before the server starts.
+            const char * env = getenv("LLAMA_INTROSPECT");
+            introspect_enabled = env != nullptr && atoi(env) != 0;
+            const char * env_bytes = getenv("LLAMA_INTROSPECT_MAX_BYTES");
+            if (env_bytes != nullptr && atoll(env_bytes) > 0) {
+                introspect_max_bytes = atoll(env_bytes);
+            }
+            if (introspect_enabled) {
+                params_base.cb_eval           = server_introspect_cb;
+                params_base.cb_eval_user_data = &introspect_capture;
+            }
+            SRV_INF("introspection: %s (activation budget %" PRId64 " MiB)\n", introspect_enabled ?
+                    "enabled (POST /v1/introspect)" : "disabled (LLAMA_INTROSPECT=0)", introspect_max_bytes >> 20);
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
-
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
             return false;
@@ -1498,6 +1547,13 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        // PS5LM fork: number of layers, for building activation tensor names
+        introspect_n_layer = llama_model_n_layer(model_tgt);
+        if (introspect_enabled) {
+            SRV_INF("introspection: model has %d layers, vocab %d\n",
+                    introspect_n_layer, llama_vocab_n_tokens(vocab));
+        }
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
@@ -2519,6 +2575,27 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
+        // PS5LM fork: the raw logits / activations this request asked for
+        if (!slot.task->params.introspect.interventions.empty()) {
+            json ivs = json::array();
+            int64_t total = 0;
+            for (size_t k = 0; k < slot.task->params.introspect.interventions.size(); ++k) {
+                const auto & iv = slot.task->params.introspect.interventions[k];
+                json e = iv.to_json();
+                const int64_t applied = k < slot.introspect_iv_modified.size() ? slot.introspect_iv_modified[k] : 0;
+                e["modified"] = applied;
+                total += applied;
+                ivs.push_back(e);
+            }
+            slot.introspect.interventions = ivs;
+            if (total > 0) {
+                // the KV cache now holds intervened activations: do not let a later
+                // request reuse this prefix
+                slot.prompt_clear();
+            }
+        }
+        res->introspect = slot.introspect.to_json();
+
         queue_results.send(std::move(res));
     }
 
@@ -3326,13 +3403,35 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            // PS5LM fork: an all-positions introspection request renders one token at a
+            // time, so that every position is the newest row of its own graph
+            const int32_t introspect_step = introspect_prepare_step();
+            int32_t n_batch_use = n_batch;
+            if (introspect_step > 0) {
+                n_batch_use = std::min(n_batch, introspect_step);
+            }
+            const int32_t n_tokens = std::min(n_batch_use, batch.size() - off);
+            // PS5LM fork: the capture maps a tensor row back to the token's sequence
+            // position with this. The batch offset is not that position: a generated
+            // token decodes at offset 0, and a reused prefix shifts the prompt rows.
+            introspect_capture.row_pos.clear();
+            for (int32_t i = off; i < off + n_tokens; ++i) {
+                introspect_capture.row_pos.push_back(batch.tokens[i].pos);
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
-                bool ok = decode(n_batch, off, batch_view);
+                bool ok = decode(n_batch_use, off, batch_view);
+                if (n_batch_use != n_batch) {
+                    // decode() can shrink its batch size on failure: keep this loop in step
+                    n_batch = n_batch_use;
+                }
+                // PS5LM fork: harvest before post_decode(), which may release the slot
+                if (ok) {
+                    introspect_harvest(off, n_tokens);
+                }
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -3998,13 +4097,21 @@ private:
                             break;
                         }
 
+                        // PS5LM fork: an introspection request may want the logits and
+                        // activations of every prompt position, and llama.cpp computes the
+                        // last layer's output only for rows that ask for it - so a
+                        // position-specific intervention needs the flag on every row too
+                        const bool introspect_all =
+                            slot.task->params.introspect.enabled &&
+                            slot.task->params.introspect.step_tokens() > 0;
+
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
-                            slot.need_embd());
+                            slot.need_embd() || introspect_all);
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -4223,6 +4330,159 @@ private:
         }
 
         return true;
+    }
+
+    // PS5LM fork: introspection (interpretability) -------------------------------
+
+    // Arms the graph-eval capture for the chunk that is about to be decoded and
+    // returns the render step: an all-positions request renders one token at a
+    // time, so that every position is the newest row of its own graph (and of the
+    // context's output buffer).
+    int32_t introspect_prepare_step() {
+        const server_slot * islot = nullptr;
+        if (introspect_enabled && batch.slot_batched != nullptr && batch.slot_batched->task != nullptr) {
+            const auto & p = batch.slot_batched->task->params.introspect;
+            if (p.enabled && p.any()) {
+                islot = batch.slot_batched;
+            }
+        }
+        if (islot == nullptr) {
+            introspect_capture.armed = false;
+            return 0;
+        }
+        introspect_capture.clear();
+        introspect_capture.row   = -1; // the newest token of the chunk
+        introspect_capture.armed = islot->task->params.introspect.want_activations() ||
+                                   islot->task->params.introspect.want_interventions();
+        if (introspect_capture.armed) {
+            introspect_capture.build_names(islot->task->params.introspect, introspect_n_layer);
+        }
+        return islot->task->params.introspect.step_tokens();
+    }
+
+    // Collects the logits of the rows that just decoded and the activations the
+    // graph-eval callback copied out of the graph. Runs on the main loop thread,
+    // between decode() and post_decode(), so the slot is still alive.
+    void introspect_harvest(int32_t off, int32_t n_tokens) {
+        if (!introspect_enabled) {
+            return;
+        }
+        // the capture engine keeps the newest row, i.e. the one this position belongs to
+        const int32_t act_index = off + n_tokens - 1;
+
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+        for (auto & slot : slots) {
+            if (slot.task == nullptr || !slot.task->params.introspect.enabled) {
+                continue;
+            }
+            const auto & p = slot.task->params.introspect;
+
+            if (slot.introspect.positions.is_null()) {
+                slot.introspect.positions = json::array();
+            }
+
+            // meta and the request's own tokenization, once per task: positions
+            // index into this list
+            if (slot.introspect.meta.is_null()) {
+                json toks = json::array();
+                for (size_t i = 0; i < slot.task->tokens.size(); ++i) {
+                    toks.push_back(json {
+                        {"index", (int) i},
+                        {"id",    slot.task->tokens[i]},
+                        {"piece", common_token_to_piece(vocab, slot.task->tokens[i], true)},
+                    });
+                }
+                slot.introspect.inputs = toks;
+                slot.introspect.meta   = json {
+                    {"model",       model_name},
+                    {"build",       llama_build_info()},
+                    {"n_vocab",     n_vocab},
+                    {"n_layer",     introspect_n_layer},
+                    {"n_ctx",       slot.n_ctx},
+                    {"n_tokens",    (int) slot.task->tokens.size()},
+                    {"n_prompt",    (int) slot.task->tokens.size()},
+                    {"request",     server_introspect_params_to_json(p)},
+                };
+            }
+
+            for (int32_t j = 0; j < n_tokens; ++j) {
+                const int32_t i = off + j;
+                const auto & bt = batch.tokens[i];
+                if (bt.id_slot != slot.id || !bt.output) {
+                    continue; // another slot's row, or a row nobody asked for
+                }
+                const bool generated = (int32_t) bt.pos >= (int32_t) slot.task->tokens.size();
+                if (generated && !p.capture_generated) {
+                    continue;
+                }
+                // the row's position is its index in the request's token list: prompt
+                // rows keep their prompt index even when a cached prefix is reused, and
+                // generated tokens continue past the prompt
+                const int32_t index = (int32_t) bt.pos;
+                if (!generated && !p.wants_position(index, (int32_t) slot.task->tokens.size())) {
+                    continue;
+                }
+
+                json e = json::object();
+                e["index"]     = index;
+                e["id"]        = bt.token;
+                e["piece"]     = common_token_to_piece(vocab, bt.token, true);
+                e["generated"] = generated;
+                if (generated) {
+                    e["step"] = slot.introspect_n_gen;
+                }
+
+                if (p.want_logits) {
+                    const float * logits = llama_get_logits_ith(ctx_tgt, j);
+                    if (logits != nullptr) {
+                        const bool allow_full = slot.introspect_n_full < p.max_full_rows;
+                        json lj;
+                        server_introspect_logits(logits, n_vocab, vocab, p, allow_full, lj);
+                        if (p.full && allow_full) {
+                            slot.introspect_n_full++;
+                        }
+                        e["logits"] = lj;
+                    }
+                }
+
+                if (p.want_activations() && i == act_index && !introspect_capture.data.empty()) {
+                    // bound the response: a wide activation request over a long prompt
+                    // would otherwise be gigabytes of base64
+                    size_t need = 0;
+                    for (const auto & kv : introspect_capture.data) {
+                        need += kv.second.data.size() * sizeof(float);
+                    }
+                    if (slot.introspect_n_bytes + (int64_t) need > introspect_max_bytes) {
+                        slot.introspect.truncated = true;
+                    } else {
+                        json act = json::object();
+                        for (const auto & kv : introspect_capture.data) {
+                            act[kv.first] = kv.second.to_json();
+                        }
+                        e["activations"] = act;
+                        slot.introspect_n_bytes += (int64_t) need;
+                    }
+                }
+
+                slot.introspect.positions.push_back(e);
+                if (generated) {
+                    slot.introspect_n_gen++;
+                }
+            }
+
+            // PS5LM fork: interventions are counted across the whole request
+            if (!introspect_capture.ivs.empty()) {
+                if (slot.introspect_iv_modified.size() != introspect_capture.ivs.size()) {
+                    slot.introspect_iv_modified.assign(introspect_capture.ivs.size(), 0);
+                }
+                for (size_t k = 0; k < introspect_capture.ivs.size(); ++k) {
+                    slot.introspect_iv_modified[k] += introspect_capture.ivs[k].modified;
+                }
+            }
+        }
+
+        introspect_capture.clear();
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
@@ -4650,6 +4910,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+
+            // PS5LM fork: introspection (interpretability).
+            // A request may ask for the raw logits of the positions it names and/or
+            // for the activations of the layers it names.
+            if (!task.params.introspect_json.is_null()) {
+                task.params.introspect = server_introspect_params_from_json(task.params.introspect_json);
+            }
+            if (task.params.introspect.enabled) {
+                if (!ctx_server.is_introspect_enabled()) {
+                    throw std::runtime_error("introspection is disabled on this server (start it without LLAMA_INTROSPECT=0)");
+                }
+                // one complete evaluation, no streaming: the caller wants the data, not a chat
+                task.params.stream = false;
+                task.params.verbose = true;
+                task.params.sampling.n_probs = 0;
+                // backend sampling records only the sampled candidates, which would
+                // hide the rest of the vocabulary from llama_get_logits_ith
+                task.params.sampling.backend_sampling = false;
+                if (task.params.introspect.all_positions) {
+                    // every position has to be evaluated in this request
+                    task.params.cache_prompt = false;
+                }
+                if (!task.params.introspect.interventions.empty()) {
+                    // a reused prefix never runs the graph, so an intervention would
+                    // touch only the uncached suffix: every position must be evaluated
+                    task.params.cache_prompt = false;
+                }
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -5496,6 +5784,49 @@ void server_routes::init_routes() {
 
     this->post_embeddings_oai = [this](const server_http_req & req) {
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
+    };
+
+    // PS5LM fork: introspection (interpretability).
+    // Same task as /completion, but the request must carry an "introspect" field,
+    // the answer is never streamed, and the response gains an "introspection"
+    // object with the raw logits and/or the layer activations that were requested.
+    this->post_introspect = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!ctx_server.is_introspect_enabled()) {
+            res->error(format_error_response(
+                "introspection is disabled on this server (start it without LLAMA_INTROSPECT=0)",
+                ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        json body = json::parse(req.body);
+        if (!body.is_object() || body.count("introspect") == 0 || body.at("introspect").is_null()) {
+            res->error(format_error_response(
+                "this endpoint needs an \"introspect\" field; see docs/INTROSPECTION.md",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // "messages" is welcome too: render the model's own chat template through the
+        // same code path as /v1/chat/completions, so the prompt that gets probed is
+        // exactly the prompt the model would be asked
+        json data = body;
+        if (body.count("messages") > 0 && !body.at("messages").is_null()) {
+            const json introspect_field = body.at("introspect");
+            common_chat_session session;
+            std::vector<raw_buffer> files;
+            json parsed = oaicompat_chat_params_parse(ctx_server.vocab, body, meta->chat_params, files, session);
+            parsed["introspect"] = introspect_field;
+            data = std::move(parsed);
+        }
+
+        std::vector<raw_buffer> files; // dummy
+        return handle_completions_impl(
+            req,
+            SERVER_TASK_TYPE_COMPLETION,
+            data,
+            files,
+            TASK_RESPONSE_TYPE_NONE);
     };
 
     this->post_rerank = [this](const server_http_req & req) {

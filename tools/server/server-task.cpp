@@ -387,6 +387,10 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
+    // PS5LM fork: raw logits and per-layer activations, when the request asked for them
+    if (!introspect.is_null()) {
+        res["introspection"] = introspect;
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 

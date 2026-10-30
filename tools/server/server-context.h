@@ -151,6 +151,8 @@ struct server_routes {
     server_http_context::handler_t post_embeddings;
     server_http_context::handler_t post_embeddings_oai;
     server_http_context::handler_t post_rerank;
+    // PS5LM fork: raw logits and per-layer activations
+    server_http_context::handler_t post_introspect;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
 

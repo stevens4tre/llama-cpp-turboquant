@@ -211,6 +211,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_rerank                 = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
+        // PS5LM fork
+        routes.post_introspect             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
         routes.post_chat_completions_tok   = models_routes->proxy_post;
         routes.post_responses_tok_oai      = models_routes->proxy_post;
@@ -258,6 +260,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
+    // PS5LM fork: raw logits and per-layer activations (interpretability)
+    ctx_http.post("/introspect",               ex_wrapper(routes.post_introspect));
+    ctx_http.post("/v1/introspect",            ex_wrapper(routes.post_introspect));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
     // token counting
     ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));

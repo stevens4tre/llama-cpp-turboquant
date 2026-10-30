@@ -187,6 +187,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("backend_sampling", params.sampling.backend_sampling))
         ->set_desc("Use backend sampling instead of llama.cpp sampling"));
 
+    // PS5LM fork: interpretability. Keep the parsed value as json; the task
+    // parses it into task_params::introspect once the task is created.
+    add((new field_json("introspect"))
+        ->set_desc("Return raw logits and/or per-layer activations for this request. "
+                   "Object with any of: logits (true or {top_k, entropy, probs, full, max_full_rows}), "
+                   "positions (\"last\", \"all\" or a list of token indices), "
+                   "activations (list of tensor names, or {tensors, layers}), generated (bool)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.introspect_json = data.at("introspect");
+        }));
+
     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
 

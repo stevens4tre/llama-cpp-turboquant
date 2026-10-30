@@ -10,6 +10,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-introspect.h" // PS5LM fork: introspection request/response types
 
 using json = nlohmann::ordered_json;
 
@@ -96,6 +97,12 @@ struct task_params {
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
+
+    // PS5LM fork: interpretability ("introspect" request field).
+    // introspect_json is the raw request value; introspect is the parsed form,
+    // filled once the task is built (see server_introspect_params_from_json).
+    json introspect_json = nullptr;
+    struct server_introspect_params introspect;
 
     json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
     json to_json(bool only_metrics = false) const;
@@ -360,6 +367,9 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<std::string>  response_fields;
 
     task_params generation_params;
+
+    // PS5LM fork: the introspection payload of this request (null unless requested)
+    json introspect = nullptr;
 
     // response formatting
     bool               verbose  = false;
