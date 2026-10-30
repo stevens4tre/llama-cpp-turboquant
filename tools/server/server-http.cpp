@@ -19,6 +19,7 @@
 class server_http_context::Impl {
 public:
     std::unique_ptr<httplib::Server> srv;
+    std::atomic<bool> stopping{false}; // PS5LM: stop() was asked: a listener that ends stays ended
 };
 
 server_http_context::server_http_context()
@@ -457,7 +458,22 @@ bool server_http_context::start() {
     }
 
     // run the HTTP server in a thread
-    thread = std::thread([this] { pimpl->srv->listen_after_bind(); });
+    // PS5LM: when the network drops (link down, a new DHCP address),
+    // accept() fails with an error httplib takes as fatal and closes the
+    // listening socket: the model stays loaded with nothing to reach it.
+    // Bind again, once a second, until it works or stop() is asked.
+    thread = std::thread([this] {
+        while (!pimpl->srv->listen_after_bind() && !pimpl->stopping) {
+            SRV_ERR("listener on %s stopped unexpectedly (errno %d); listening again\n", listening_address.c_str(), errno);
+            do {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                pimpl->srv->stop(); // clears the failed state; the socket is closed already
+            } while (!pimpl->stopping && !pimpl->srv->bind_to_port(hostname, port));
+            if (!pimpl->stopping) {
+                SRV_INF("listener on %s is back\n", listening_address.c_str());
+            }
+        }
+    });
     srv->wait_until_ready();
 
     listening_address = is_sock ? string_format("unix://%s", hostname.c_str())
@@ -466,6 +482,7 @@ bool server_http_context::start() {
 }
 
 void server_http_context::stop() const {
+    pimpl->stopping = true;
     if (pimpl->srv) {
         pimpl->srv->stop();
     }
