@@ -167,6 +167,10 @@ private:
     size_t head;
     size_t tail;
 
+#if defined(__PROSPERO__)
+    size_t dropped = 0; // entries refused since the writer last caught up
+#endif
+
     bool print_entry(const common_log_entry & e) const {
         if (e.is_end) return true;
 
@@ -200,8 +204,19 @@ public:
     void add(enum ggml_log_level level, const char * fmt, va_list args) {
         std::unique_lock<std::mutex> lock(mtx);
 
+#if defined(__PROSPERO__)
+        // PS5LM: never wait for the writer. It prints every line to stdout and
+        // to --log-file, and when that stalls a full queue froze the server
+        // thread mid-print_timings (/slots and /metrics hung, /health stayed
+        // 200). Drop the line and count it; the writer reports the count.
+        if (running && is_full()) {
+            dropped++;
+            return;
+        }
+#else
         // block if the queue is full
         cv_full.wait(lock, [this]() { return !running || !is_full(); });
+#endif
 
         if (!running) {
             // discard messages while the worker thread is paused
@@ -280,6 +295,21 @@ public:
                 lock.lock();
                 head = next_head;
                 cv_full.notify_all();
+
+#if defined(__PROSPERO__)
+                // PS5LM: one line for everything add() dropped, once there is
+                // room for it. The loop prints it on the next pass.
+                if (dropped > 0 && !is_full()) {
+                    auto & entry = queue[tail];
+                    snprintf(entry.msg.data(), entry.msg.size(), "%zu log lines dropped, the log writer fell behind\n", dropped);
+                    entry.is_end    = false;
+                    entry.level     = GGML_LOG_LEVEL_WARN;
+                    entry.prefix    = prefix;
+                    entry.timestamp = timestamps ? t_us() - t_start : 0;
+                    tail = (tail + 1) % queue.size();
+                    dropped = 0;
+                }
+#endif
 
                 if (stop) {
                     break;
