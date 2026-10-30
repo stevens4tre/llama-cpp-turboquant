@@ -176,6 +176,12 @@ public:
         const std::string p = expand_home(path);
 
         fs::path full = path_from_utf8(p);
+        // PS5LM: with LLAMA_TOOLS_ROOT set, a relative path starts there (a
+        // PS5 title cannot read its working directory).
+        const char * tools_root = std::getenv("LLAMA_TOOLS_ROOT");
+        if (!full.is_absolute() && tools_root && *tools_root) {
+            full = path_from_utf8(tools_root) / full;
+        }
         if (!full.is_absolute()) {
             if (cwd.empty()) {
                 std::error_code ec;
@@ -192,6 +198,15 @@ public:
         // a trailing ".." normalizes to a path that ends with a separator
         if (!full.has_filename() && full != full.root_path()) {
             full = full.parent_path();
+        }
+        // PS5LM: with LLAMA_TOOLS_ROOT set, the tools see that folder as the
+        // whole filesystem: a path outside it is taken as relative to it.
+        if (const char * root_env = std::getenv("LLAMA_TOOLS_ROOT"); root_env && *root_env) {
+            const fs::path root = path_from_utf8(root_env).lexically_normal();
+            const fs::path rel  = full.lexically_relative(root);
+            if (rel.empty() || *rel.begin() == "..") {
+                full = (root / full.relative_path()).lexically_normal();
+            }
         }
         return path_to_utf8(full);
     }
